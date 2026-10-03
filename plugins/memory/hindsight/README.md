@@ -46,7 +46,12 @@ Points the plugin at an existing Hindsight instance you're already running (Dock
 
 ## Config
 
-Config file: `~/.hermes/hindsight/config.json`
+Config file: `<active Hermes home>/hindsight/config.json` (normally
+`~/.hermes/hindsight/config.json`; a named profile uses its own home). Configure
+the active profile with `hermes memory setup`. API and LLM keys belong in that
+profile's secret settings; do not copy another profile's `.env` to share memory.
+The `bank_id` or `bank_id_template` determines the server-side bank separately
+from the profile-local config file.
 
 ### Connection
 
@@ -94,9 +99,12 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `auto_retain` | `true` | Automatically retain conversation turns |
 | `retain_async` | `true` | Process retain asynchronously on the Hindsight server |
+| `prefetch_waits_for_retain` | `true` | Wait for pending retain work before the next background prefetch |
+| `prefetch_retain_drain_timeout` | `10.0` | Maximum wait in seconds for the retain queue and server operations; off the reply path |
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
+| `observation_scopes` | — | Consolidation scopes sent on retain: `per_tag`, `combined`, `all_combinations`, or explicit tag groups; unset uses the server default |
 | `retain_source` | — | Opt-in `metadata.source` attached to retained memories (identifies the storing client, e.g. `hermes`). Empty by default — no attribution tag ships unless you set it. |
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
@@ -155,3 +163,19 @@ Available in `hybrid` and `tools` memory modes:
 ## Client Version
 
 Requires `hindsight-client >= 0.6.1`. The plugin auto-upgrades on session start if an older version is detected.
+
+
+## Checking the actual memory path
+
+An accepted asynchronous retain can still be processing. A later recall that
+returns nothing does not by itself prove retain failed: indexing/consolidation,
+`recall_types` and tag filters also affect visibility. The background prefetch
+normally waits for retain completion, bounded by `prefetch_retain_drain_timeout`.
+
+Check the active profile, API URL and resolved bank first. For a roundtrip,
+retain a distinctive non-sensitive fact through Hermes, allow the server
+operation to complete, then recall it through the same profile with the intended
+types and tags. Checking the bank directly through HTTP or another MCP client
+proves server access, but does not exercise Hermes' automatic recall/retain or
+its profile selection. For observations-only recall, verify consolidation has
+completed or temporarily broaden `recall_types` to inspect raw facts.
