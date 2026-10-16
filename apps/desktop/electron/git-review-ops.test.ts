@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 import { afterEach, test, vi } from 'vitest'
 
 import {
@@ -14,7 +14,7 @@ import {
   REVIEW_FILE_CAP,
   reviewCreatePr,
   reviewList,
-  SIMPLE_GIT_UNSAFE_BINARY_WARN
+  trustedAuthEnv
 } from './git-review-ops'
 import type * as NoConsoleGit from './no-console-git'
 
@@ -97,11 +97,10 @@ test('gitFor accepts a Windows no-console host tuple with restricted characters'
   }
 })
 
-test('gitFor suppresses only the known custom-binary warning and restores console.warn', () => {
+test('gitFor accepts trusted custom binaries without suppressing unrelated warnings', () => {
   const spacedBin = String.raw`C:\Program Files\Git\cmd\git.exe`
-  // `windowsGitHost()` resolves nothing in this process (no configured roots, no
-  // HERMES_DESKTOP_PYTHON), so `gitBin` itself is what simple-git validates — the
-  // spaced `Program Files` path, which warns once per factory call.
+  // Without a configured Windows host, the internally resolved spaced path is
+  // passed directly to simple-git with the trusted custom-binary option.
   const warnings: unknown[][] = []
   const originalWarn = console.warn
 
@@ -118,16 +117,15 @@ test('gitFor suppresses only the known custom-binary warning and restores consol
 
     assert.equal(console.warn, recordingWarn)
 
-    // The escape hatch used directly still warns: the message gitFor filters is a
-    // live emission of the installed simple-git, so the filter cannot go stale
-    // silently (an upgrade that rewords it fails this test, not production).
+    // Version 4 accepts the trusted binary without the old 3.x warning; unrelated
+    // diagnostics must still reach the original console sink.
     simpleGit({ baseDir: process.cwd(), binary: spacedBin, unsafe: { allowUnsafeCustomBinary: true } })
     console.warn('unrelated warning')
   } finally {
     console.warn = originalWarn
   }
 
-  assert.deepEqual(warnings, [[SIMPLE_GIT_UNSAFE_BINARY_WARN], ['unrelated warning']])
+  assert.deepEqual(warnings, [['unrelated warning']])
 })
 
 test('resolveRenamePath: simple rename resolves to the new path', () => {
@@ -229,4 +227,78 @@ test('reviewCreatePr falls back to the generic message when gh reports no stderr
   failGh('')
 
   await assert.rejects(reviewCreatePr(dir, 'git', 'gh'), /is gh installed and authenticated\?/)
+})
+
+test('trustedAuthEnv keeps the process-owned git auth keys and drops sandboxed ones', () => {
+  const env = trustedAuthEnv({
+    PATH: '/usr/bin',
+    HOME: '/home/user',
+    SSH_AUTH_SOCK: '/run/agent.sock',
+    GIT_SSH_COMMAND: 'ssh -i /key',
+    GIT_SSH: '/usr/bin/ssh',
+    GIT_ASKPASS: '/usr/bin/askpass',
+    GIT_PAGER: 'cat',
+    GIT_DIR: '/tmp/repo.git',
+    GIT_EXEC_PATH: '/usr/lib/git-core',
+    GIT_CONFIG_GLOBAL: '/tmp/gitconfig',
+    PAGER: 'cat',
+    EDITOR: 'vim',
+    VISUAL: 'code',
+    SSH_ASKPASS: '/usr/bin/ssh-askpass'
+  })
+
+  assert.equal(env.GIT_SSH_COMMAND, 'ssh -i /key')
+  assert.equal(env.GIT_SSH, '/usr/bin/ssh')
+  assert.equal(env.GIT_ASKPASS, '/usr/bin/askpass')
+  assert.equal(env.PATH, '/usr/bin')
+  assert.equal(env.HOME, '/home/user')
+  assert.equal(env.SSH_AUTH_SOCK, '/run/agent.sock')
+
+  for (const dropped of [
+    'GIT_PAGER',
+    'GIT_DIR',
+    'GIT_EXEC_PATH',
+    'GIT_CONFIG_GLOBAL',
+    'PAGER',
+    'EDITOR',
+    'VISUAL',
+    'SSH_ASKPASS'
+  ]) {
+    assert.equal(Object.hasOwn(env, dropped), false, `${dropped} must stay behind the sandbox`)
+  }
+})
+
+test('gitFor hands the trusted auth env through to the git child process', async () => {
+  const dir = makeRepo()
+
+  execFileSync('git', ['config', 'alias.envdump', '!env'], { cwd: dir })
+
+  const previousSshCommand = process.env.GIT_SSH_COMMAND
+  const previousPager = process.env.GIT_PAGER
+
+  process.env.GIT_SSH_COMMAND = 'ssh -o BatchMode=yes -i /nonexistent'
+  process.env.GIT_PAGER = 'cat'
+
+  try {
+    const out = await gitFor(dir, 'git').raw(['envdump'])
+    const envLines = out.split('\n')
+
+    assert.ok(
+      envLines.some(line => line.startsWith('GIT_SSH_COMMAND=')),
+      'GIT_SSH_COMMAND must reach the git child (simple-git 4 filters it without the opt-ins)'
+    )
+    assert.ok(!envLines.some(line => line.startsWith('GIT_PAGER=')), 'GIT_PAGER must stay sandboxed')
+  } finally {
+    if (previousSshCommand === undefined) {
+      delete process.env.GIT_SSH_COMMAND
+    } else {
+      process.env.GIT_SSH_COMMAND = previousSshCommand
+    }
+
+    if (previousPager === undefined) {
+      delete process.env.GIT_PAGER
+    } else {
+      process.env.GIT_PAGER = previousPager
+    }
+  }
 })
