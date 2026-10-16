@@ -67,15 +67,67 @@ function gitFor(cwd, gitBin) {
 
   // simple-git 4 accepts the trusted custom-binary option without the old 3.x
   // warning. No process-global console mutation is needed around construction.
+  // The environment sandbox needs its opt-ins (see TRUSTED_AUTH_ENV_KEYS): list
+  // the trusted auth keys so the ambient env keeps them, and enable the
+  // matching vulnerability categories for the explicit env built below.
   const git = simpleGit({
     baseDir: cwd,
     binary,
     maxConcurrentProcesses: 4,
     trimmed: false,
-    ...(unsafe ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
+    allowEnvironment: [...TRUSTED_AUTH_ENV_KEYS],
+    unsafe: {
+      ...(unsafe ? { allowUnsafeCustomBinary: true } : {}),
+      allowUnsafeSshCommand: true,
+      allowUnsafeAskPass: true
+    }
   })
 
-  return Array.isArray(binary) ? git.env(noConsoleGitEnv(process.env, gitBin || 'git')) : git
+  // The no-console host is the only caller that passes an explicit env; build
+  // it sanitized (trusted auth keys kept, all other sandboxed keys dropped) or
+  // simple-git rejects the spawn outright.
+  return Array.isArray(binary) ? git.env(noConsoleGitEnv(trustedAuthEnv(process.env), gitBin || 'git')) : git
+}
+
+// simple-git 4 sandboxes the child environment: every `git_*` variable (plus a
+// fixed set of git-related names such as editor/pager/ssh-askpass variants) is
+// stripped from the ambient env, and passing one through an explicit `.env()`
+// is rejected unless opted in. The Review pane's git calls must keep receiving
+// this process's own authentication inputs — a custom SSH key/host config
+// (GIT_SSH_COMMAND/GIT_SSH) or a credential helper (GIT_ASKPASS) — so exactly
+// these three are opted in; every other sandboxed variable stays behind the
+// guard.
+export const TRUSTED_AUTH_ENV_KEYS = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_ASKPASS'] as const
+
+// Non-prefixed names on simple-git's sandbox list (`git_*` is covered by the
+// prefix check); its environment guard and vulnerability checks share it.
+const SANDBOXED_ENV_KEY_NAMES = new Set(['editor', 'visual', 'pager', 'prefix', 'ssh_askpass'])
+
+function isSandboxedEnvKey(key: string): boolean {
+  const lower = key.toLowerCase()
+
+  return lower.startsWith('git_') || SANDBOXED_ENV_KEY_NAMES.has(lower)
+}
+
+// Sanitize the explicit env for the no-console host: keep the trusted auth
+// keys, drop every other sandboxed variable.
+export function trustedAuthEnv(base: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const allowed = new Set<string>(TRUSTED_AUTH_ENV_KEYS.map(key => key.toLowerCase()))
+  const env: NodeJS.ProcessEnv = {}
+
+  for (const [key, value] of Object.entries(base || {})) {
+    if (value === undefined) {
+      continue
+    }
+
+    if (isSandboxedEnvKey(key) && !allowed.has(key.toLowerCase())) {
+      continue
+    }
+
+    env[key] = value
+  }
+
+  return env
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve

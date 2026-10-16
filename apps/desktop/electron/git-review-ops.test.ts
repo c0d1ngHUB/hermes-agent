@@ -13,7 +13,8 @@ import {
   resolveRenamePath,
   REVIEW_FILE_CAP,
   reviewCreatePr,
-  reviewList
+  reviewList,
+  trustedAuthEnv
 } from './git-review-ops'
 import type * as NoConsoleGit from './no-console-git'
 
@@ -226,4 +227,78 @@ test('reviewCreatePr falls back to the generic message when gh reports no stderr
   failGh('')
 
   await assert.rejects(reviewCreatePr(dir, 'git', 'gh'), /is gh installed and authenticated\?/)
+})
+
+test('trustedAuthEnv keeps the process-owned git auth keys and drops sandboxed ones', () => {
+  const env = trustedAuthEnv({
+    PATH: '/usr/bin',
+    HOME: '/home/user',
+    SSH_AUTH_SOCK: '/run/agent.sock',
+    GIT_SSH_COMMAND: 'ssh -i /key',
+    GIT_SSH: '/usr/bin/ssh',
+    GIT_ASKPASS: '/usr/bin/askpass',
+    GIT_PAGER: 'cat',
+    GIT_DIR: '/tmp/repo.git',
+    GIT_EXEC_PATH: '/usr/lib/git-core',
+    GIT_CONFIG_GLOBAL: '/tmp/gitconfig',
+    PAGER: 'cat',
+    EDITOR: 'vim',
+    VISUAL: 'code',
+    SSH_ASKPASS: '/usr/bin/ssh-askpass'
+  })
+
+  assert.equal(env.GIT_SSH_COMMAND, 'ssh -i /key')
+  assert.equal(env.GIT_SSH, '/usr/bin/ssh')
+  assert.equal(env.GIT_ASKPASS, '/usr/bin/askpass')
+  assert.equal(env.PATH, '/usr/bin')
+  assert.equal(env.HOME, '/home/user')
+  assert.equal(env.SSH_AUTH_SOCK, '/run/agent.sock')
+
+  for (const dropped of [
+    'GIT_PAGER',
+    'GIT_DIR',
+    'GIT_EXEC_PATH',
+    'GIT_CONFIG_GLOBAL',
+    'PAGER',
+    'EDITOR',
+    'VISUAL',
+    'SSH_ASKPASS'
+  ]) {
+    assert.equal(Object.hasOwn(env, dropped), false, `${dropped} must stay behind the sandbox`)
+  }
+})
+
+test('gitFor hands the trusted auth env through to the git child process', async () => {
+  const dir = makeRepo()
+
+  execFileSync('git', ['config', 'alias.envdump', '!env'], { cwd: dir })
+
+  const previousSshCommand = process.env.GIT_SSH_COMMAND
+  const previousPager = process.env.GIT_PAGER
+
+  process.env.GIT_SSH_COMMAND = 'ssh -o BatchMode=yes -i /nonexistent'
+  process.env.GIT_PAGER = 'cat'
+
+  try {
+    const out = await gitFor(dir, 'git').raw(['envdump'])
+    const envLines = out.split('\n')
+
+    assert.ok(
+      envLines.some(line => line.startsWith('GIT_SSH_COMMAND=')),
+      'GIT_SSH_COMMAND must reach the git child (simple-git 4 filters it without the opt-ins)'
+    )
+    assert.ok(!envLines.some(line => line.startsWith('GIT_PAGER=')), 'GIT_PAGER must stay sandboxed')
+  } finally {
+    if (previousSshCommand === undefined) {
+      delete process.env.GIT_SSH_COMMAND
+    } else {
+      process.env.GIT_SSH_COMMAND = previousSshCommand
+    }
+
+    if (previousPager === undefined) {
+      delete process.env.GIT_PAGER
+    } else {
+      process.env.GIT_PAGER = previousPager
+    }
+  }
 })
