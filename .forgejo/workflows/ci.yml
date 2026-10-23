@@ -1,5 +1,3 @@
-# Forgejo host-runner checks only. No publishing or deployment.
-# .forgejo/workflows takes precedence over imported GitHub workflows.
 name: Forgejo CI
 'on':
   push:
@@ -35,5 +33,8 @@ jobs:
 
         unset HERMES_SCRATCH_DIR
 
-        uv run --no-project --python 3.14 --with pytest --with packaging python -m pytest tests/test_project_metadata.py tests/test_hermes_constants.py
-        -q'
+        uv venv --python 3.14 .venv
+
+        uv pip install --python .venv/bin/python -e . pytest
+
+        .venv/bin/python -m pytest tests/test_project_metadata.py tests/test_hermes_constants.py -q'
