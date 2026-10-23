@@ -1,0 +1,34 @@
+# Forgejo host-runner checks only. No publishing or deployment.
+# .forgejo/workflows takes precedence over imported GitHub workflows.
+name: Forgejo CI
+'on':
+  push:
+    branches:
+    - main
+    - master
+    - ci/forgejo-verification-20261023
+  pull_request: {}
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: forgejo-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      HERMES_HOME: ${{ runner.temp }}/hermes-ci-home
+      HERMES_TEST_ALLOW_REAL_HOME_IO: '0'
+    steps:
+    - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Run fork metadata and profile-contract baseline (not full upstream CI)
+      shell: bash
+      run: 'set -euo pipefail
+
+        uv run --no-project --python 3.14 --with pytest --with packaging python -m pytest tests/test_project_metadata.py tests/test_hermes_constants.py
+        -q'
