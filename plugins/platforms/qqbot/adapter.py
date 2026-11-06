@@ -41,11 +41,11 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult,
-    _ssrf_redirect_guard, cache_document_from_bytes_async, cache_image_from_bytes_async,
+    cache_document_from_bytes_async, cache_image_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import strip_markdown
-from gateway.platforms.helpers import MessageDeduplicator, cancel_task
+from gateway.platforms.helpers import MessageDeduplicator, cancel_task, platform_http_client
 from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from gateway.platforms.media_cache import ext_for_mime
 
@@ -206,11 +206,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         try:
             # Tighter keepalive pool so idle CLOSE_WAIT sockets drain faster behind proxies.
             # See #18451.
-            from gateway.platforms._http_client_limits import platform_httpx_limits
-            from tools.url_safety import create_ssrf_safe_async_client
-            self._http_client = create_ssrf_safe_async_client(
-                timeout=30.0, follow_redirects=True,
-                event_hooks={"response": [_ssrf_redirect_guard]}, limits=platform_httpx_limits())
+            self._http_client = platform_http_client()
 
             await self._open_gateway_ws(log_url=True)
             self._listen_task = asyncio.create_task(self._listen_loop())
@@ -788,7 +784,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         nick = str(member.get("nick", "")) or str(author.get("username", ""))
         await self._ingest(
             d, msg_id, content, d.get("attachments"), timestamp,
-            chat_id=channel_id, qq_chat_type="guild", user_id=author_id, user_name=nick or None, chat_type="group")
+            chat_id=channel_id, qq_chat_type="guild", user_id=author_id, user_name=nick or None, chat_type="group",
+            is_bot=bool(author.get("bot")))
 
     async def _handle_dm_message(self, d, msg_id, content, author, timestamp) -> None:
         guild_id = str(d.get("guild_id", ""))
@@ -801,7 +798,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return
         await self._ingest(
             d, msg_id, content, d.get("attachments"), timestamp,
-            chat_id=guild_id, qq_chat_type="dm", user_id=author_id, chat_type="dm")
+            chat_id=guild_id, qq_chat_type="dm", user_id=author_id, chat_type="dm",
+            is_bot=bool(author.get("bot")))
 
     _INBOUND_HANDLERS = {
         "C2C_MESSAGE_CREATE": "_handle_c2c_message",

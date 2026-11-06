@@ -40,6 +40,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms._shared import config_connected_extra
 from agent.i18n import t
 from gateway.platforms.base import BasePlatformAdapter, ExecApprovalPrompt, SendResult, transcode_to_ogg_opus
 from gateway.platforms.base_exec_approval import ea_header_text
@@ -496,6 +497,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     _EA_CODE_CLOSE = "\n```\n\n"
     _EA_CMD_BUDGET = 800  # body caps at 1024; leave room for the framing prose
 
+    def _approval_request_ids(self) -> OrderedDict[str, str]:
+        """approval_id → ``tools.approval`` request id; created on first use, like Telegram's
+        ``_approval_counter``, so adapters assembled without ``__init__`` still resolve."""
+        return self.__dict__.setdefault("_exec_approval_request_ids", OrderedDict())
+
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Approve / Deny buttons only (a 3-button cap leaves no room for the session/always
         tiers); a tap resolves via ``tools.approval.resolve_gateway_approval``."""
@@ -504,8 +510,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._truncate_body(prompt.text),
             (f"appr:{approval_id}:approve", self._truncate_button_label(t("platform.whatsapp.approve_button"))),
             (f"appr:{approval_id}:deny", self._truncate_button_label(t("platform.whatsapp.deny_button"))))
-        return await self._send_interactive(
+        result = await self._send_interactive(
             prompt.chat_id, interactive, prompt.metadata, self._exec_approval_state, approval_id, prompt.session_key)
+        if result.success and prompt.request_id:
+            bounded_put(self._approval_request_ids(), approval_id, prompt.request_id, INTERACTIVE_STATE_CACHE_SIZE)
+        return result
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str, metadata: Optional[dict[str, Any]] = None,
@@ -611,11 +620,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             chat_id, file_path, "document", caption=caption, filename=file_name or os.path.basename(file_path), reply_to=reply_to,
         )
 
-    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
+                         is_voice: Optional[bool] = None, **kwargs) -> SendResult:
         """Voice message: ``audio/ogg; codecs=opus`` renders as a voice bubble, so a
-        local MP3 (Hermes TTS output) is converted via ffmpeg first; other audio is sent as-is."""
+        local MP3 (Hermes TTS output) is converted via ffmpeg first; other audio is sent as-is.
+        A plain audio MEDIA file (``is_voice=False``) is never converted into a voice bubble."""
         mime_type: Optional[str] = None
-        if not audio_path.startswith(_HTTP_PREFIXES) and audio_path.lower().endswith(".mp3") and os.path.exists(audio_path):
+        if is_voice is False and audio_path.lower().endswith(".mp3"):
+            mime_type = "audio/mpeg"
+        elif (not audio_path.startswith(_HTTP_PREFIXES) and audio_path.lower().endswith(".mp3")
+              and await asyncio.to_thread(os.path.exists, audio_path)):
             opus_path = await self._convert_to_opus(audio_path)
             if opus_path:
                 try:
@@ -918,10 +932,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         if not session_key:
             return False
+        request_id = self._approval_request_ids().pop(approval_id, None)
         approval = _optional_module("tools.approval", "[whatsapp_cloud] approval resolver unavailable")
         if approval is None:
             return False
-        count = approval.resolve_gateway_approval(session_key, choice)
+        count = approval.resolve_gateway_approval_card(session_key, choice, request_id)
         # A tap after the wait timed out (count == 0) must not claim approval:
         # the command was already denied fail-closed.
         if count:
@@ -1085,6 +1100,17 @@ def _interactive_setup() -> None:
     run_whatsapp_cloud_setup()
 
 
+# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
+_PLATFORM_HINT = (
+    "You are on WhatsApp (Meta Business Cloud API). Standard markdown auto-converts to WhatsApp syntax "
+    "\u2014 write markdown freely. No tables \u2014 use bullets or labeled lines. "
+    "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
+    "Images (.jpg, .png) send as photos, videos (.mp4) inline, audio as voice/audio, other files as "
+    "documents; ![alt](url) works. NOTE: Meta refuses free-form replies when the user hasn't messaged in "
+    "24h (error 131047) \u2014 relevant only for delayed/scheduled sends."
+)
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system.
 
@@ -1092,11 +1118,20 @@ def register(ctx) -> None:
     ``whatsapp_cloud_unconfigured`` fatal error (same outcome as the former core wiring). No
     ``standalone_sender_fn`` / ``max_message_length``: out-of-process ``send_message`` had no
     WhatsApp Cloud sender in core either, and ``send()`` chunks itself."""
+    from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
         name="whatsapp_cloud", label="WhatsApp Business (Cloud)", adapter_factory=WhatsAppCloudAdapter,
+        dashboard_label="WhatsApp Cloud API",
+        dashboard_description="Use Hermes via Meta's hosted WhatsApp Cloud API (no local bridge).",
+        docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/whatsapp-cloud",
         check_fn=check_whatsapp_cloud_requirements, is_connected=_is_connected,
+        config_connected_fn=config_connected_extra("phone_number_id", "access_token"),
         required_env=["WHATSAPP_CLOUD_PHONE_NUMBER_ID", "WHATSAPP_CLOUD_ACCESS_TOKEN"],
         install_hint="aiohttp/httpx missing — reinstall hermes-agent", setup_fn=_interactive_setup,
-        allowed_users_env="WHATSAPP_CLOUD_ALLOWED_USERS", allow_all_env="WHATSAPP_CLOUD_ALLOW_ALL_USERS",
         cron_deliver_env_var="WHATSAPP_CLOUD_HOME_CHANNEL", emoji="📱", allow_update_command=False,
+        platform_hint=_PLATFORM_HINT,
+        # Adapter lacks edit_message; promote once it lands.
+        display_tier="low",
+        env_overrides=gateway_env.ENV_OVERRIDES,
+        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
     )

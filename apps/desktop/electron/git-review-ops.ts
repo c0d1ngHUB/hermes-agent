@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
+import { isGitEnvKey } from '@simple-git/argv-parser'
 import { simpleGit } from 'simple-git'
 
 import { resolveRequestedPathForIpc } from './hardening'
@@ -18,6 +19,53 @@ const COMMIT_CONTEXT_UNTRACKED_MAX = 80
 const REVIEW_FILE_CAP = 2_000
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
+
+// simple-git validates a custom binary path against an ASCII whitelist
+// (`/^([a-z]:)?([a-z0-9/.\_~-]+)$/i`). Everything outside it is "restricted": a
+// space in the default `C:\Program Files\Git\...`, the parentheses in
+// `Program Files (x86)`, the accented user name in `C:\Users\João\...`. Without
+// `unsafe.allowUnsafeCustomBinary` simple-git THROWS on such a path.
+
+// simple-git 4 strips every guarded variable (any `GIT_*`, plus EDITOR, VISUAL,
+// PAGER, PREFIX, SSH_ASKPASS) from the environment git runs with, and rejects
+// the task when one is passed explicitly through `.env()`. These are the ones
+// the Review pane keeps forwarding from the user's own environment: the SSH
+// transport and askpass helpers `git push` authenticates with, and
+// GIT_TERMINAL_PROMPT, which stops a credential prompt from blocking a git
+// process that has no terminal.
+export const SIMPLE_GIT_ALLOWED_ENV = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_TERMINAL_PROMPT']
+
+// simple-git's vulnerability check additionally rejects GIT_SSH/GIT_SSH_COMMAND
+// and GIT_ASKPASS/SSH_ASKPASS in an explicit `.env()` (the Windows host path
+// below) unless these categories are enabled. The values come from the user's
+// environment, never from the renderer.
+const SIMPLE_GIT_ALLOWED_ENV_UNSAFE = { allowUnsafeAskPass: true, allowUnsafeSshCommand: true }
+
+const ALLOWED_ENV_KEYS = new Set(SIMPLE_GIT_ALLOWED_ENV.map(key => key.toLowerCase()))
+
+// Same test simple-git's environment guard applies, so the explicit env never
+// carries a key the guard would reject.
+function isGuardedGitEnvKey(key: string): boolean {
+  const lower = key.toLowerCase().trim()
+
+  return lower.startsWith('git_') || isGitEnvKey(lower)
+}
+
+// Explicit env for the Windows no-console host tuple: the host script needs
+// HERMES_GIT_ARGV0, and simple-git replaces the inherited env with whatever
+// `.env()` receives, so the rest of the environment is forwarded minus the
+// guarded keys that are not allow-listed.
+export function simpleGitHostEnv(base: NodeJS.ProcessEnv | undefined, gitBin: string): NodeJS.ProcessEnv {
+  const env = noConsoleGitEnv(base, gitBin)
+
+  for (const key of Object.keys(env)) {
+    if (isGuardedGitEnvKey(key) && !ALLOWED_ENV_KEYS.has(key.toLowerCase().trim())) {
+      delete env[key]
+    }
+  }
+
+  return env
+}
 
 // GUI-launched Electron apps on macOS inherit only a minimal PATH (no
 // /opt/homebrew/bin or /usr/local/bin), so `gh` — and the `git` gh shells out
@@ -63,71 +111,18 @@ function gitFor(cwd, gitBin) {
   // forwards argv unchanged.
   const host = windowsGitHost()
   const binary = simpleGitBinary(gitBin, host)
-  const unsafe = Boolean(gitBin) || Array.isArray(binary)
+  const unsafeBinary = Boolean(gitBin) || Array.isArray(binary)
 
-  // simple-git 4 accepts the trusted custom-binary option without the old 3.x
-  // warning. No process-global console mutation is needed around construction.
-  // The environment sandbox needs its opt-ins (see TRUSTED_AUTH_ENV_KEYS): list
-  // the trusted auth keys so the ambient env keeps them, and enable the
-  // matching vulnerability categories for the explicit env built below.
   const git = simpleGit({
+    allowEnvironment: SIMPLE_GIT_ALLOWED_ENV,
     baseDir: cwd,
     binary,
     maxConcurrentProcesses: 4,
     trimmed: false,
-    allowEnvironment: [...TRUSTED_AUTH_ENV_KEYS],
-    unsafe: {
-      ...(unsafe ? { allowUnsafeCustomBinary: true } : {}),
-      allowUnsafeSshCommand: true,
-      allowUnsafeAskPass: true
-    }
+    unsafe: { ...SIMPLE_GIT_ALLOWED_ENV_UNSAFE, ...(unsafeBinary ? { allowUnsafeCustomBinary: true } : {}) }
   })
 
-  // The no-console host is the only caller that passes an explicit env; build
-  // it sanitized (trusted auth keys kept, all other sandboxed keys dropped) or
-  // simple-git rejects the spawn outright.
-  return Array.isArray(binary) ? git.env(noConsoleGitEnv(trustedAuthEnv(process.env), gitBin || 'git')) : git
-}
-
-// simple-git 4 sandboxes the child environment: every `git_*` variable (plus a
-// fixed set of git-related names such as editor/pager/ssh-askpass variants) is
-// stripped from the ambient env, and passing one through an explicit `.env()`
-// is rejected unless opted in. The Review pane's git calls must keep receiving
-// this process's own authentication inputs — a custom SSH key/host config
-// (GIT_SSH_COMMAND/GIT_SSH) or a credential helper (GIT_ASKPASS) — so exactly
-// these three are opted in; every other sandboxed variable stays behind the
-// guard.
-export const TRUSTED_AUTH_ENV_KEYS = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_ASKPASS'] as const
-
-// Non-prefixed names on simple-git's sandbox list (`git_*` is covered by the
-// prefix check); its environment guard and vulnerability checks share it.
-const SANDBOXED_ENV_KEY_NAMES = new Set(['editor', 'visual', 'pager', 'prefix', 'ssh_askpass'])
-
-function isSandboxedEnvKey(key: string): boolean {
-  const lower = key.toLowerCase()
-
-  return lower.startsWith('git_') || SANDBOXED_ENV_KEY_NAMES.has(lower)
-}
-
-// Sanitize the explicit env for the no-console host: keep the trusted auth
-// keys, drop every other sandboxed variable.
-export function trustedAuthEnv(base: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
-  const allowed = new Set<string>(TRUSTED_AUTH_ENV_KEYS.map(key => key.toLowerCase()))
-  const env: NodeJS.ProcessEnv = {}
-
-  for (const [key, value] of Object.entries(base || {})) {
-    if (value === undefined) {
-      continue
-    }
-
-    if (isSandboxedEnvKey(key) && !allowed.has(key.toLowerCase())) {
-      continue
-    }
-
-    env[key] = value
-  }
-
-  return env
+  return Array.isArray(binary) ? git.env(simpleGitHostEnv(process.env, gitBin || 'git')) : git
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve
